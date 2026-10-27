@@ -1,0 +1,36 @@
+2026-08-09 13:16:18,762 INFO main Starting SOC Triage AI backend…
+2026-08-09 13:16:21,726 INFO pipeline.classifier XGBoost model loaded from ./models/xgboost_classifier.pkl
+2026-08-09 13:16:27,376 INFO pipeline.rag RAG pipeline initialized with Supabase pgvector
+2026-08-09 13:16:27,377 INFO main Backend ready.
+2026-08-09 13:16:55,127 DEBUG main CALL _run_pipeline
+2026-08-09 13:16:55,132 DEBUG pipeline.guardrail CALL run_input_guardrail
+2026-08-09 13:16:56,494 WARNING presidio-analyzer model_to_presidio_entity_mapping is missing from configuration, using default
+2026-08-09 13:16:56,494 WARNING presidio-analyzer low_score_entity_names is missing from configuration, using default
+2026-08-09 13:16:56,495 WARNING presidio-analyzer labels_to_ignore is missing from configuration, using default
+2026-08-09 13:16:57,135 INFO pipeline.guardrail Presidio engines initialized
+2026-08-09 13:16:57,264 DEBUG pipeline.guardrail [AUDIT-TEST-001] pii_redacted={'command_line': ['IP_ADDRESS'], 'decoded_command': ['IP_ADDRESS'], 'user': ['URL'], 'source_ip': ['IP_ADDRESS', 'DATE_TIME'], 'target_ip': ['DATE_TIME', 'IP_ADDRESS']}
+2026-08-09 13:16:57,265 DEBUG pipeline.guardrail RETURN run_input_guardrail (2124ms)
+2026-08-09 13:16:57,265 INFO main [AUDIT-TEST-001] guardrail: passed pii_scan=REDACTED
+2026-08-09 13:16:57,266 DEBUG pipeline.classifier CALL predict
+2026-08-09 13:16:57,267 DEBUG pipeline.classifier [AUDIT-TEST-001] features={'severity_encoded': 3.0, 'user_type_encoded': 1.0, 'hour_of_day': 2.0, 'is_weekend': 0.0, 'historical_tp_count': 3.0, 'historical_fp_count': 0.0, 'mitre_tactic_encoded': 2.0, 'is_external_ip': 0.0, 'is_known_tool': 1.0, 'target_is_dc': 1.0} probabilities={'FALSE_POSITIVE': 0.1113, 'NEEDS_REVIEW': 0.2425, 'TRUE_POSITIVE': 0.6462}
+2026-08-09 13:16:57,268 DEBUG pipeline.classifier RETURN predict (2ms)
+2026-08-09 13:16:57,269 INFO main [AUDIT-TEST-001] xgboost: verdict=TRUE_POSITIVE confidence=0.6462
+2026-08-09 13:16:57,269 DEBUG pipeline.rag CALL retrieve_similar
+2026-08-09 13:16:58,925 DEBUG pipeline.rag [AUDIT-TEST-001] candidates=[{'ticket_id': 'INC-2026-1086', 'similarity': 0.141, 'verdict': 'TRUE_POSITIVE'}, {'ticket_id': 'INC-2026-1067', 'similarity': 0.1417, 'verdict': 'TRUE_POSITIVE'}, {'ticket_id': 'INC-2026-1036', 'similarity': 0.1418, 'verdict': 'TRUE_POSITIVE'}]
+2026-08-09 13:16:58,926 DEBUG pipeline.rag RETURN retrieve_similar (1655ms)
+2026-08-09 13:16:58,927 INFO main [AUDIT-TEST-001] rag: hits=3
+2026-08-09 13:16:59,001 DEBUG pipeline.llm [AUDIT-TEST-001] CALL run_llm_triage
+2026-08-09 13:17:01,864 DEBUG pipeline.llm [AUDIT-TEST-001] RETURN run_llm_triage model=gpt-4o-mini call_ms=2337 tokens={'prompt_tokens': 762, 'completion_tokens': 164, 'total_tokens': 926}
+2026-08-09 13:17:01,865 INFO main [AUDIT-TEST-001] llm: verdict=TRUE_POSITIVE risk_score=85
+2026-08-09 13:17:01,865 DEBUG pipeline.guardrail CALL validate_llm_output
+2026-08-09 13:17:01,866 DEBUG pipeline.guardrail RETURN validate_llm_output (0ms)
+2026-08-09 13:17:01,866 INFO main [AUDIT-TEST-001] output_rail: PASSED
+2026-08-09 13:17:01,866 DEBUG pipeline.sir_generator CALL generate_sir
+2026-08-09 13:17:01,867 DEBUG pipeline.sir_generator RETURN generate_sir (0ms)
+2026-08-09 13:17:01,867 INFO main [AUDIT-TEST-001] sir: generated (2136 chars)
+2026-08-09 13:17:01,868 INFO main [AUDIT-TEST-001] TIMING guardrail=2131ms xgboost=3ms rag=1658ms llm=2937ms sir=2ms total=6732ms
+2026-08-09 13:17:01,868 INFO main [AUDIT-TEST-001] DONE verdict=TRUE_POSITIVE time=6732ms
+2026-08-09 13:17:01,870 DEBUG pipeline.audit CALL log_audit_entry
+2026-08-09 13:17:02,402 INFO pipeline.audit [AUDIT-TEST-001] audit: row written
+2026-08-09 13:17:02,406 DEBUG pipeline.audit RETURN log_audit_entry (534ms)
+2026-08-09 13:17:02,408 DEBUG main RETURN _run_pipeline (7273ms)

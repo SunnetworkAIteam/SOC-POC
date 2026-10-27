@@ -1,0 +1,392 @@
+"""
+SOC Triage AI — FastAPI backend.
+Endpoints:
+  POST /api/triage/excel       — process uploaded Excel file
+  POST /api/triage/single      — process single ticket JSON
+  GET  /api/triage/{id}        — retrieve cached result
+  GET  /api/triage/{id}/pdf    — download cached result as a PDF report
+  GET  /api/langsmith/summary  — aggregate LLM run stats from LangSmith
+  GET  /api/langsmith/runs     — recent LLM runs from LangSmith
+  GET  /api/health             — health check
+"""
+
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from io import BytesIO
+from logging.handlers import RotatingFileHandler
+from typing import Any
+
+import pandas as pd
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(".env", override=True)
+except ImportError:
+    pass
+api_key = os.getenv("OPENAI_API_KEY")
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
+
+# ---------------------------------------------------------------------------
+# Logging: console + rotating file. LOG_DIR defaults to ./logs (ephemeral on
+# Render without a paid persistent disk — the Supabase audit_log table is the
+# durable source of truth; this file is for tailing recent activity).
+#
+# LOG_LEVEL controls verbosity (default DEBUG — always-on micro-level detail:
+# XGBoost feature vector + full probability distribution, RAG candidate
+# scores, LLM token usage, which fields Presidio redacted, and a CALL/
+# RETURN/RAISE trace of every pipeline function). Set LOG_LEVEL=INFO to
+# quiet it back down to just the per-stage narration if it gets too noisy.
+# ---------------------------------------------------------------------------
+LOG_DIR = os.getenv("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "DEBUG").upper(), logging.DEBUG)
+
+_log_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_formatter)
+
+_file_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "soc_triage.log"),
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+)
+_file_handler.setFormatter(_log_formatter)
+
+logging.basicConfig(level=LOG_LEVEL, handlers=[_console_handler, _file_handler])
+
+# Quiet noisy third-party loggers regardless of LOG_LEVEL — DEBUG is for our
+# own pipeline's micro-detail, not library internals.
+for _noisy in ("presidio-analyzer", "presidio-anonymizer", "httpx", "httpcore", "openai", "urllib3", "llama_index"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+# In-memory result cache keyed by ticket_id
+_result_cache: dict[str, dict] = {}
+
+# Raw pipeline materials kept separately (not part of the API response schema),
+# used only to regenerate the PDF report on demand.
+_pdf_context_cache: dict[str, dict] = {}
+
+# ---------------------------------------------------------------------------
+# Startup / shutdown
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting SOC Triage AI backend…")
+    from pipeline.classifier import load_model
+    from pipeline.rag import init_rag
+
+    load_model()
+    init_rag()
+    logger.info("Backend ready.")
+    yield
+    logger.info("Shutting down.")
+
+
+app = FastAPI(
+    title="SOC Triage AI",
+    version="0.1.0",
+    description="Level-1 SOC triage automation: ML + RAG + LLM pipeline",
+    lifespan=lifespan,
+)
+
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestration
+# ---------------------------------------------------------------------------
+
+from models.ticket import REQUIRED_EXCEL_COLUMNS, TicketIn
+from models.response import GuardrailStatus, SimilarIncident, TriageResult, TriageResponse, TriageSummary
+from models.langsmith import LangSmithRunsResponse, LangSmithSummary
+from pipeline.call_trace import trace_calls
+
+
+@trace_calls
+def _run_pipeline(ticket: TicketIn) -> dict[str, Any]:
+    """Run the full triage pipeline for a single ticket. Returns a result dict."""
+    t0 = time.perf_counter()
+
+    from pipeline.guardrail import run_input_guardrail, validate_llm_output
+    from pipeline.classifier import predict
+    from pipeline.rag import retrieve_similar, ticket_to_text
+    from pipeline.llm import run_llm_triage
+    from pipeline.sir_generator import generate_sir
+
+    tid = ticket.ticket_id
+
+    # Step 1: Guardrail — PII strip + injection check
+    guard = run_input_guardrail(ticket)
+    if guard["blocked"]:
+        logger.info(f"[{tid}] guardrail: BLOCKED (prompt injection detected)")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ticket {ticket.ticket_id} blocked by input guardrail (prompt injection detected).",
+        )
+
+    safe_ticket: dict = guard["safe_ticket"]
+    guardrail_status: dict = guard["guardrail_status"]
+    logger.info(f"[{tid}] guardrail: passed pii_scan={guardrail_status.get('presidio_pii_scan')}")
+    t1 = time.perf_counter()
+
+    # Step 2: XGBoost classifier
+    ml_result = predict(ticket)
+    logger.info(f"[{tid}] xgboost: verdict={ml_result['verdict']} confidence={ml_result['confidence']:.4f}")
+    t2 = time.perf_counter()
+
+    # Step 3: RAG — similar incidents
+    ticket_text = ticket_to_text(ticket.model_dump(mode="json"))
+    similar = retrieve_similar(ticket_text, tid)
+    logger.info(f"[{tid}] rag: hits={len(similar)}")
+    t3 = time.perf_counter()
+
+    # Step 4: LLM triage
+    llm_result = run_llm_triage(safe_ticket, ml_result, similar)
+    logger.info(f"[{tid}] llm: verdict={llm_result['verdict']} risk_score={llm_result['risk_score']}")
+    t4 = time.perf_counter()
+
+    # Step 5: Output guardrail
+    llm_result, output_rail_status = validate_llm_output(llm_result)
+    guardrail_status["nemo_output_rail"] = output_rail_status
+    logger.info(f"[{tid}] output_rail: {output_rail_status}")
+
+    # Step 6: SIR report
+    sir = generate_sir(
+        ticket=ticket.model_dump(mode="json"),
+        llm_result=llm_result,
+        ml_result=ml_result,
+        similar_incidents=similar,
+        guardrail_status=guardrail_status,
+    )
+    logger.info(f"[{tid}] sir: generated ({len(sir)} chars)")
+    t5 = time.perf_counter()
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    stage_timings_ms = {
+        "guardrail": int((t1 - t0) * 1000),
+        "xgboost": int((t2 - t1) * 1000),
+        "rag": int((t3 - t2) * 1000),
+        "llm": int((t4 - t3) * 1000),
+        "sir": int((t5 - t4) * 1000),
+        "total": elapsed_ms,
+    }
+    logger.info(
+        f"[{tid}] TIMING guardrail={stage_timings_ms['guardrail']}ms "
+        f"xgboost={stage_timings_ms['xgboost']}ms rag={stage_timings_ms['rag']}ms "
+        f"llm={stage_timings_ms['llm']}ms sir={stage_timings_ms['sir']}ms total={elapsed_ms}ms"
+    )
+    logger.info(f"[{tid}] DONE verdict={llm_result['verdict']} time={elapsed_ms}ms")
+
+    result = {
+        "ticket_id": ticket.ticket_id,
+        "verdict": llm_result["verdict"],
+        "confidence": llm_result["confidence"],
+        "xgboost_score": ml_result.get("xgboost_score", ml_result["confidence"]),
+        "llm_reasoning": llm_result["reasoning"],
+        "root_cause": llm_result.get("root_cause", ""),
+        "contributing_factors": llm_result.get("contributing_factors", []),
+        "mitre_attack": ticket.mitre_attack,
+        "risk_score": llm_result["risk_score"],
+        "sir_report": sir,
+        "processing_time_ms": elapsed_ms,
+        "similar_past_incidents": similar,
+        "guardrail_status": guardrail_status,
+    }
+
+    _result_cache[ticket.ticket_id] = result
+    _pdf_context_cache[ticket.ticket_id] = {
+        "ticket": ticket.model_dump(mode="json"),
+        "llm_result": llm_result,
+        "ml_result": ml_result,
+        "similar": similar,
+        "guardrail_status": guardrail_status,
+    }
+
+    from pipeline.audit import log_audit_entry
+
+    # audit_raw carries everything in `result` plus micro-level diagnostics
+    # (feature vector, full probability distribution, LLM token usage, and
+    # a per-stage timing breakdown) that aren't part of the public API
+    # response shape but make the durable audit trail a genuinely useful
+    # "clear picture" of what happened, queryable via Supabase jsonb ops.
+    audit_raw = {
+        **result,
+        "ml_features": ml_result.get("features", {}),
+        "ml_probabilities": ml_result.get("probabilities", {}),
+        "llm_model": llm_result.get("model"),
+        "llm_token_usage": llm_result.get("token_usage"),
+        "llm_call_ms": llm_result.get("llm_call_ms"),
+        "stage_timings_ms": stage_timings_ms,
+    }
+
+    log_audit_entry(
+        ticket_id=ticket.ticket_id,
+        verdict=llm_result["verdict"],
+        confidence=llm_result["confidence"],
+        risk_score=llm_result["risk_score"],
+        xgboost_verdict=ml_result["verdict"],
+        guardrail_blocked=False,
+        processing_time_ms=elapsed_ms,
+        raw=audit_raw,
+    )
+
+    return result
+
+
+def _build_summary(results: list[dict]) -> dict:
+    tp = sum(1 for r in results if r["verdict"] == "TRUE_POSITIVE")
+    fp = sum(1 for r in results if r["verdict"] == "FALSE_POSITIVE")
+    nr = sum(1 for r in results if r["verdict"] == "NEEDS_REVIEW")
+    return {"total": len(results), "true_positive": tp, "false_positive": fp, "needs_review": nr}
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "service": "SOC Triage AI"}
+
+
+@app.post("/api/triage/single")
+async def triage_single(ticket: TicketIn):
+    """Process a single ticket submitted as JSON."""
+    result = _run_pipeline(ticket)
+    summary = _build_summary([result])
+    return {"results": [result], "summary": summary}
+
+
+@app.post("/api/triage/excel")
+async def triage_excel(file: UploadFile = File(...)):
+    """
+    Upload an Excel file (.xlsx / .xls) containing multiple tickets.
+    Returns triage results for every row.
+    """
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only .xlsx or .xls files are accepted.")
+
+    contents = await file.read()
+    try:
+        df = pd.read_excel(BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse Excel file: {exc}")
+
+    # Column validation
+    received = list(df.columns)
+    missing = [col for col in REQUIRED_EXCEL_COLUMNS if col not in received]
+    if missing:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": f"Missing required columns: {missing}",
+                "expected_columns": REQUIRED_EXCEL_COLUMNS,
+                "received_columns": received,
+            },
+        )
+
+    results = []
+    errors = []
+
+    for idx, row in df.iterrows():
+        row_dict = row.to_dict()
+        # Coerce numeric fields
+        for field in ("hour_of_day", "historical_tp_count", "historical_fp_count"):
+            row_dict[field] = int(row_dict.get(field, 0))
+
+        try:
+            ticket = TicketIn(**row_dict)
+            result = _run_pipeline(ticket)
+            results.append(result)
+        except HTTPException as exc:
+            errors.append({"row": idx + 2, "ticket_id": row_dict.get("ticket_id"), "error": exc.detail})
+        except Exception as exc:
+            errors.append({"row": idx + 2, "ticket_id": row_dict.get("ticket_id"), "error": str(exc)})
+
+    summary = _build_summary(results)
+    response: dict[str, Any] = {"results": results, "summary": summary}
+    if errors:
+        response["errors"] = errors
+
+    return response
+
+
+@app.get("/api/triage/{ticket_id}")
+async def get_result(ticket_id: str):
+    """Retrieve a cached triage result by ticket ID."""
+    result = _result_cache.get(ticket_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No result found for ticket {ticket_id}.")
+    return result
+
+
+@app.get("/api/triage/{ticket_id}/pdf")
+async def get_result_pdf(ticket_id: str):
+    """Download the Security Incident Report for a ticket as a PDF."""
+    context = _pdf_context_cache.get(ticket_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail=f"No result found for ticket {ticket_id}.")
+
+    from pipeline.pdf_generator import generate_pdf
+
+    pdf_bytes = generate_pdf(
+        ticket=context["ticket"],
+        llm_result=context["llm_result"],
+        ml_result=context["ml_result"],
+        similar_incidents=context["similar"],
+        guardrail_status=context["guardrail_status"],
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="SIR-{ticket_id}.pdf"'},
+    )
+
+
+VALID_RANGES = {"24h", "7d", "30d"}
+
+
+@app.get("/api/langsmith/summary", response_model=LangSmithSummary)
+async def langsmith_summary(range: str = "24h", tz: str = "UTC"):
+    """Aggregate LLM run stats (latency, tokens, cost, errors) from LangSmith.
+
+    `tz` is the caller's IANA timezone (e.g. "Asia/Kolkata") so the
+    runs-over-time buckets align with the viewer's local calendar day/hour
+    instead of the server's UTC day.
+    """
+    if range not in VALID_RANGES:
+        raise HTTPException(status_code=400, detail=f"range must be one of {sorted(VALID_RANGES)}")
+
+    from pipeline.langsmith_stats import get_summary
+
+    return get_summary(range, tz)
+
+
+@app.get("/api/langsmith/runs", response_model=LangSmithRunsResponse)
+async def langsmith_runs(range: str = "24h", limit: int = 50):
+    """Recent LLM runs from LangSmith, each linking to the full trace."""
+    if range not in VALID_RANGES:
+        raise HTTPException(status_code=400, detail=f"range must be one of {sorted(VALID_RANGES)}")
+
+    from pipeline.langsmith_stats import get_recent_runs
+
+    return get_recent_runs(range, limit)
